@@ -252,7 +252,7 @@ func TestMakeDealOffline(t *testing.T) {
 			carBuf := new(bytes.Buffer)
 			require.NoError(t, prepared.Write(carBuf))
 
-			err = h.Provider.ImportDataForDeal(ctx, pd.ProposalCid, carBuf)
+			err = h.Provider.ImportDataForDeal(ctx, pd.ProposalCid, carBuf, "")
 			require.NoError(t, err)
 
 			h.WaitForClientEvent(&wg, storagemarket.ClientEventDealExpired)

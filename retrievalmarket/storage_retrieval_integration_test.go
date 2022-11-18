@@ -208,7 +208,7 @@ func TestOfflineStorageRetrieval(t *testing.T) {
 			shared_testutil.AssertDealState(t, storagemarket.StorageDealWaitingForData, pd.State)
 
 			// provider imports deal
-			err = sh.Provider.ImportDataForDeal(ctx, pd.ProposalCid, carBuf)
+			err = sh.Provider.ImportDataForDeal(ctx, pd.ProposalCid, carBuf, "")
 			require.NoError(t, err)
 
 			// wait for event signalling deal completion.

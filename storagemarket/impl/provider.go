@@ -20,8 +20,6 @@ import (
 	datatransfer "github.com/filecoin-project/go-data-transfer"
 	versioning "github.com/filecoin-project/go-ds-versioning/pkg"
 	versionedfsm "github.com/filecoin-project/go-ds-versioning/pkg/fsm"
-	commcid "github.com/filecoin-project/go-fil-commcid"
-	commp "github.com/filecoin-project/go-fil-commp-hashhash"
 	"github.com/filecoin-project/go-padreader"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/crypto"
@@ -52,7 +50,12 @@ const defaultAwaitRestartTimeout = 1 * time.Hour
 // StoredAsk is an interface which provides access to a StorageAsk
 type StoredAsk interface {
 	GetAsk() *storagemarket.SignedStorageAsk
-	SetAsk(price abi.TokenAmount, verifiedPrice abi.TokenAmount, duration abi.ChainEpoch, options ...storagemarket.StorageAskOption) error
+	SetAsk(
+		price abi.TokenAmount,
+		verifiedPrice abi.TokenAmount,
+		duration abi.ChainEpoch,
+		options ...storagemarket.StorageAskOption,
+	) error
 }
 
 type MeshCreator interface {
@@ -114,7 +117,8 @@ func AwaitTransferRestartTimeout(waitTime time.Duration) StorageProviderOption {
 }
 
 // NewProvider returns a new storage provider
-func NewProvider(net network.StorageMarketNetwork,
+func NewProvider(
+	net network.StorageMarketNetwork,
 	ds datastore.Batching,
 	fs filestore.FileStore,
 	dagStore stores.DAGStoreWrapper,
@@ -164,12 +168,18 @@ func NewProvider(net network.StorageMarketNetwork,
 	h.unsubDataTransfer = dataTransfer.SubscribeToEvents(dtutils.ProviderDataTransferSubscriber(h.deals))
 
 	pph := &providerPushDeals{h}
-	err = dataTransfer.RegisterVoucherType(&requestvalidation.StorageDataTransferVoucher{}, requestvalidation.NewUnifiedRequestValidator(pph, nil))
+	err = dataTransfer.RegisterVoucherType(
+		&requestvalidation.StorageDataTransferVoucher{},
+		requestvalidation.NewUnifiedRequestValidator(pph, nil),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	err = dataTransfer.RegisterTransportConfigurer(&requestvalidation.StorageDataTransferVoucher{}, dtutils.TransportConfigurer(&providerStoreGetter{h}))
+	err = dataTransfer.RegisterTransportConfigurer(
+		&requestvalidation.StorageDataTransferVoucher{},
+		dtutils.TransportConfigurer(&providerStoreGetter{h}),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -333,34 +343,42 @@ func (p *Provider) Stop() error {
 // ImportDataForDeal manually imports data for an offline storage deal
 // It will verify that the data in the passed io.Reader matches the expected piece
 // cid for the given deal or it will error
-func (p *Provider) ImportDataForDeal(ctx context.Context, propCid cid.Cid, data io.Reader) error {
+func (p *Provider) ImportDataForDeal(ctx context.Context, propCid cid.Cid, data io.Reader, filename string) error {
 	// TODO: be able to check if we have enough disk space
 	var d storagemarket.MinerDeal
 	if err := p.deals.Get(propCid).Get(&d); err != nil {
 		return xerrors.Errorf("failed getting deal %s: %w", propCid, err)
 	}
 
-	tempfi, err := p.fs.CreateTemp()
+	tempf, err := p.fs.CreateTemp()
 	if err != nil {
 		return xerrors.Errorf("failed to create temp file for data import: %w", err)
 	}
-	defer tempfi.Close()
-	cleanup := func() {
-		_ = tempfi.Close()
-		_ = p.fs.Delete(tempfi.Path())
+	path := tempf.Path()
+	osPath := tempf.OsPath()
+	tempf.Close()
+	err = p.fs.Delete(tempf.Path())
+	if err != nil {
+		return xerrors.Errorf("delete tempfile failed: %w", err)
 	}
 
 	log.Debugw("will copy imported file to local file", "propCid", propCid)
-	n, err := io.Copy(tempfi, data)
+	err = os.Symlink(filename, string(osPath))
 	if err != nil {
-		cleanup()
 		return xerrors.Errorf("importing deal data failed: %w", err)
 	}
 	log.Debugw("finished copying imported file to local file", "propCid", propCid)
 
-	_ = n // TODO: verify n?
-
-	carSize := uint64(tempfi.Size())
+	tempfi, err := p.fs.Open(path)
+	defer tempfi.Close()
+	cleanup := func() {
+		tempfi.Close()
+		_ = p.fs.Delete(path)
+	}
+	if err != nil {
+		cleanup()
+		return xerrors.Errorf("open linked file failed: %w", err)
+	}
 
 	_, err = tempfi.Seek(0, io.SeekStart)
 	if err != nil {
@@ -368,40 +386,7 @@ func (p *Provider) ImportDataForDeal(ctx context.Context, propCid cid.Cid, data 
 		return xerrors.Errorf("failed to seek through temp imported file: %w", err)
 	}
 
-	proofType, err := p.spn.GetProofType(ctx, p.actor, nil)
-	if err != nil {
-		cleanup()
-		return xerrors.Errorf("failed to determine proof type: %w", err)
-	}
 	log.Debugw("fetched proof type", "propCid", propCid)
-
-	pieceCid, err := generatePieceCommitment(proofType, tempfi, carSize)
-	if err != nil {
-		cleanup()
-		return xerrors.Errorf("failed to generate commP: %w", err)
-	}
-	log.Debugw("generated pieceCid for imported file", "propCid", propCid)
-
-	if carSizePadded := padreader.PaddedSize(carSize).Padded(); carSizePadded < d.Proposal.PieceSize {
-		// need to pad up!
-		rawPaddedCommp, err := commp.PadCommP(
-			// we know how long a pieceCid "hash" is, just blindly extract the trailing 32 bytes
-			pieceCid.Hash()[len(pieceCid.Hash())-32:],
-			uint64(carSizePadded),
-			uint64(d.Proposal.PieceSize),
-		)
-		if err != nil {
-			cleanup()
-			return err
-		}
-		pieceCid, _ = commcid.DataCommitmentV1ToCID(rawPaddedCommp)
-	}
-
-	// Verify CommP matches
-	if !pieceCid.Equals(d.Proposal.PieceCID) {
-		cleanup()
-		return xerrors.Errorf("given data does not match expected commP (got: %s, expected %s)", pieceCid, d.Proposal.PieceCID)
-	}
 
 	log.Debugw("will fire ProviderEventVerifiedData for imported file", "propCid", propCid)
 
@@ -431,16 +416,18 @@ func (p *Provider) AddStorageCollateral(ctx context.Context, amount abi.TokenAmo
 		return err
 	}
 
-	err = p.spn.WaitForMessage(ctx, mcid, func(code exitcode.ExitCode, bytes []byte, finalCid cid.Cid, err error) error {
-		if err != nil {
-			done <- xerrors.Errorf("AddFunds errored: %w", err)
-		} else if code != exitcode.Ok {
-			done <- xerrors.Errorf("AddFunds error, exit code: %s", code.String())
-		} else {
-			done <- nil
-		}
-		return nil
-	})
+	err = p.spn.WaitForMessage(
+		ctx, mcid, func(code exitcode.ExitCode, bytes []byte, finalCid cid.Cid, err error) error {
+			if err != nil {
+				done <- xerrors.Errorf("AddFunds errored: %w", err)
+			} else if code != exitcode.Ok {
+				done <- xerrors.Errorf("AddFunds error, exit code: %s", code.String())
+			} else {
+				done <- nil
+			}
+			return nil
+		},
+	)
 
 	if err != nil {
 		return err
@@ -498,9 +485,11 @@ func (p *Provider) ListLocalDealsPage(startPropCid *cid.Cid, offset int, limit i
 	}
 
 	// Sort by creation time descending
-	sort.Slice(deals, func(i, j int) bool {
-		return deals[i].CreationTime.Time().After(deals[j].CreationTime.Time())
-	})
+	sort.Slice(
+		deals, func(i, j int) bool {
+			return deals[i].CreationTime.Time().After(deals[j].CreationTime.Time())
+		},
+	)
 
 	// Iterate through deals until we reach the target signed proposal cid,
 	// find the offset from there, then add deals from that point up to limit
@@ -529,7 +518,12 @@ func (p *Provider) ListLocalDealsPage(startPropCid *cid.Cid, offset int, limit i
 
 // SetAsk configures the storage miner's ask with the provided price,
 // duration, and options. Any previously-existing ask is replaced.
-func (p *Provider) SetAsk(price abi.TokenAmount, verifiedPrice abi.TokenAmount, duration abi.ChainEpoch, options ...storagemarket.StorageAskOption) error {
+func (p *Provider) SetAsk(
+	price abi.TokenAmount,
+	verifiedPrice abi.TokenAmount,
+	duration abi.ChainEpoch,
+	options ...storagemarket.StorageAskOption,
+) error {
 	return p.storedAsk.SetAsk(price, verifiedPrice, duration, options...)
 }
 
@@ -541,11 +535,13 @@ func (p *Provider) AnnounceDealToIndexer(ctx context.Context, proposalCid cid.Ci
 		return xerrors.Errorf("failed getting deal %s: %w", proposalCid, err)
 	}
 
-	mt := metadata.New(&metadata.GraphsyncFilecoinV1{
-		PieceCID:      deal.Proposal.PieceCID,
-		FastRetrieval: deal.FastRetrieval,
-		VerifiedDeal:  deal.Proposal.VerifiedDeal,
-	})
+	mt := metadata.New(
+		&metadata.GraphsyncFilecoinV1{
+			PieceCID:      deal.Proposal.PieceCID,
+			FastRetrieval: deal.FastRetrieval,
+			VerifiedDeal:  deal.Proposal.VerifiedDeal,
+		},
+	)
 
 	if err := p.meshCreator.Connect(ctx); err != nil {
 		return fmt.Errorf("cannot publish index record as indexer host failed to connect to the full node: %w", err)
@@ -553,8 +549,10 @@ func (p *Provider) AnnounceDealToIndexer(ctx context.Context, proposalCid cid.Ci
 
 	annCid, err := p.indexProvider.NotifyPut(ctx, deal.ProposalCid.Bytes(), mt)
 	if err == nil {
-		log.Infow("deal announcement sent to index provider", "advertisementCid", annCid, "shard-key", deal.Proposal.PieceCID,
-			"proposalCid", deal.ProposalCid)
+		log.Infow(
+			"deal announcement sent to index provider", "advertisementCid", annCid, "shard-key", deal.Proposal.PieceCID,
+			"proposalCid", deal.ProposalCid,
+		)
 	}
 	return err
 }
@@ -599,7 +597,13 @@ func (p *Provider) AnnounceAllDealsToIndexer(ctx context.Context) error {
 		nSuccess++
 	}
 
-	log.Infow("finished announcing active deals to index provider", "number of deals", nSuccess, "number of shards", shards)
+	log.Infow(
+		"finished announcing active deals to index provider",
+		"number of deals",
+		nSuccess,
+		"number of shards",
+		shards,
+	)
 	return merr
 }
 
@@ -691,7 +695,10 @@ func (p *Provider) HandleDealStatusStream(s network.DealStatusStream) {
 	}
 }
 
-func (p *Provider) processDealStatusRequest(ctx context.Context, request *network.DealStatusRequest) (*storagemarket.ProviderDealState, error) {
+func (p *Provider) processDealStatusRequest(
+	ctx context.Context,
+	request *network.DealStatusRequest,
+) (*storagemarket.ProviderDealState, error) {
 	// fetch deal state
 	var md = storagemarket.MinerDeal{}
 	if err := p.deals.Get(request.Proposal).Get(&md); err != nil {
@@ -712,7 +719,14 @@ func (p *Provider) processDealStatusRequest(ctx context.Context, request *networ
 		return nil, xerrors.Errorf("internal error")
 	}
 
-	err = providerutils.VerifySignature(ctx, request.Signature, md.ClientDealProposal.Proposal.Client, buf, tok, p.spn.VerifySignature)
+	err = providerutils.VerifySignature(
+		ctx,
+		request.Signature,
+		md.ClientDealProposal.Proposal.Client,
+		buf,
+		tok,
+		p.spn.VerifySignature,
+	)
 	if err != nil {
 		log.Errorf("invalid deal status request signature: %s", err)
 		return nil, xerrors.Errorf("internal error")
@@ -757,7 +771,13 @@ func (p *Provider) dispatch(eventName fsm.EventName, deal fsm.StateType) {
 	}
 	pubSubEvt := internalProviderEvent{evt, realDeal}
 
-	log.Debugw("process storage provider listeners", "name", storagemarket.ProviderEvents[evt], "proposal cid", realDeal.ProposalCid)
+	log.Debugw(
+		"process storage provider listeners",
+		"name",
+		storagemarket.ProviderEvents[evt],
+		"proposal cid",
+		realDeal.ProposalCid,
+	)
 	if err := p.pubSub.Publish(pubSubEvt); err != nil {
 		log.Errorf("failed to publish event %d", evt)
 	}
@@ -787,28 +807,30 @@ func (p *Provider) start(ctx context.Context) (err error) {
 	}
 
 	// register indexer provider callback now that everything has booted up.
-	p.indexProvider.RegisterMultihashLister(func(ctx context.Context, contextID []byte) (provider.MultihashIterator, error) {
-		proposalCid, err := cid.Cast(contextID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to cast context ID to a cid")
-		}
+	p.indexProvider.RegisterMultihashLister(
+		func(ctx context.Context, contextID []byte) (provider.MultihashIterator, error) {
+			proposalCid, err := cid.Cast(contextID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to cast context ID to a cid")
+			}
 
-		var deal storagemarket.MinerDeal
-		if err := p.deals.Get(proposalCid).Get(&deal); err != nil {
-			return nil, xerrors.Errorf("failed getting deal %s: %w", proposalCid, err)
-		}
+			var deal storagemarket.MinerDeal
+			if err := p.deals.Get(proposalCid).Get(&deal); err != nil {
+				return nil, xerrors.Errorf("failed getting deal %s: %w", proposalCid, err)
+			}
 
-		ii, err := p.dagStore.GetIterableIndexForPiece(deal.Proposal.PieceCID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get iterable index: %w", err)
-		}
+			ii, err := p.dagStore.GetIterableIndexForPiece(deal.Proposal.PieceCID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get iterable index: %w", err)
+			}
 
-		mhi, err := provider.CarMultihashIterator(ii)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get mhiterator: %w", err)
-		}
-		return mhi, nil
-	})
+			mhi, err := provider.CarMultihashIterator(ii)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get mhiterator: %w", err)
+			}
+			return mhi, nil
+		},
+	)
 
 	return nil
 }
@@ -877,16 +899,24 @@ func (p *Provider) resendProposalResponse(s network.StorageDealStream, md *stora
 	return err
 }
 
-func newProviderStateMachine(ds datastore.Batching, env fsm.Environment, notifier fsm.Notifier, storageMigrations versioning.VersionedMigrationList, target versioning.VersionKey) (fsm.Group, func(context.Context) error, error) {
-	return versionedfsm.NewVersionedFSM(ds, fsm.Parameters{
-		Environment:     env,
-		StateType:       storagemarket.MinerDeal{},
-		StateKeyField:   "State",
-		Events:          providerstates.ProviderEvents,
-		StateEntryFuncs: providerstates.ProviderStateEntryFuncs,
-		FinalityStates:  providerstates.ProviderFinalityStates,
-		Notifier:        notifier,
-	}, storageMigrations, target)
+func newProviderStateMachine(
+	ds datastore.Batching,
+	env fsm.Environment,
+	notifier fsm.Notifier,
+	storageMigrations versioning.VersionedMigrationList,
+	target versioning.VersionKey,
+) (fsm.Group, func(context.Context) error, error) {
+	return versionedfsm.NewVersionedFSM(
+		ds, fsm.Parameters{
+			Environment:     env,
+			StateType:       storagemarket.MinerDeal{},
+			StateKeyField:   "State",
+			Events:          providerstates.ProviderEvents,
+			StateEntryFuncs: providerstates.ProviderStateEntryFuncs,
+			FinalityStates:  providerstates.ProviderFinalityStates,
+			Notifier:        notifier,
+		}, storageMigrations, target,
+	)
 }
 
 type internalProviderEvent struct {
